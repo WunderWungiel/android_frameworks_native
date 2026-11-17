@@ -16,6 +16,8 @@
 
 #include "GaneshGpuContext.h"
 
+#include <android-base/properties.h>
+
 #include <include/core/SkImageInfo.h>
 #include <include/core/SkSurface.h>
 #include <include/core/SkTraceMemoryDump.h>
@@ -40,7 +42,17 @@ namespace android::renderengine::skia {
 namespace {
 static GrContextOptions ganeshOptions(GrContextOptions::PersistentCache& skSLCacheMonitor) {
     GrContextOptions options;
-    options.fDisableDriverCorrectnessWorkarounds = true;
+    // Skia's driver correctness workarounds are off by default here. Some legacy
+    // drivers need them for basic functionality, e.g. ES3 drivers that advertise
+    // only GL_OES_EGL_image_external (not _essl3): Skia enables external texture
+    // support for those through a workaround (skbug.com/7713). Without it every
+    // external-OES buffer fails to wrap and RenderEngine aborts. Some of those
+    // drivers (e.g. Adreno 3xx) also reject the _essl3 extension directive that
+    // the workaround adds to ESSL3 shaders, so fall back to ESSL 1.00 there.
+    const bool driverWorkarounds =
+            android::base::GetBoolProperty("ro.renderengine.skia.driver_workarounds", false);
+    options.fDisableDriverCorrectnessWorkarounds = !driverWorkarounds;
+    options.fPreferExternalImagesOverES3 = driverWorkarounds;
     options.fDisableDistanceFieldPaths = true;
     options.fReducedShaderVariations = true;
     options.fPersistentCache = &skSLCacheMonitor;
