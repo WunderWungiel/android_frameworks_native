@@ -319,5 +319,74 @@ size_t flattenTrivialDoWhile(std::string& src) {
     return hits.size();
 }
 
+namespace {
+
+bool isPrecisionType(std::string_view v) {
+    static constexpr std::string_view kTypes[] = {
+            "float", "vec2",   "vec3",   "vec4",   "mat2",   "mat3",   "mat4",
+            "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2",
+            "mat4x3", "mat4x4", "int",    "ivec2",  "ivec3",  "ivec4",  "uint",
+            "uvec2",  "uvec3",  "uvec4",
+    };
+    for (std::string_view t : kTypes) {
+        if (v == t) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+size_t promoteUniformBlockPrecision(std::string& src) {
+    const std::vector<Token> t = tokenize(src);
+    struct Edit {
+        size_t begin;
+        size_t end; // == begin: insertion
+        std::string_view text;
+    };
+    std::vector<Edit> edits;
+
+    // Uniform block: `uniform <name> {` at global scope (optionally preceded by
+    // a layout qualifier, which does not matter here).
+    int depth = 0;
+    for (size_t i = 0; i < t.size(); i++) {
+        const std::string_view v = t[i].text;
+        if (v == "{") depth++;
+        if (v == "}") depth--;
+        if (depth != 0 || v != "uniform" || i + 2 >= t.size() || t[i + 2].text != "{") continue;
+
+        size_t j = i + 3;
+        while (j < t.size() && t[j].text != "}") {
+            // Member declaration: [layout(...)] [precision] type name[...];
+            if (t[j].text == "layout") {
+                j++;
+                if (j >= t.size() || t[j].text != "(") return 0;
+                while (j < t.size() && t[j].text != ")") j++;
+                if (j >= t.size()) return 0;
+                j++;
+            }
+            if (j >= t.size()) return 0;
+            const std::string_view m = t[j].text;
+            if (m == "lowp" || m == "mediump") {
+                edits.push_back({t[j].begin, t[j].end, "highp"});
+            } else if (isPrecisionType(m)) {
+                edits.push_back({t[j].begin, t[j].begin, "highp "});
+            } // highp, bool and struct types: leave alone
+            while (j < t.size() && t[j].text != ";") {
+                if (t[j].text == "{" || t[j].text == "}") return 0; // unexpected syntax
+                j++;
+            }
+            if (j >= t.size()) return 0;
+            j++;
+        }
+        if (j >= t.size()) return 0;
+        i = j; // the block's closing '}'; depth is unchanged (we never counted its '{')
+    }
+
+    for (auto e = edits.rbegin(); e != edits.rend(); ++e) {
+        src.replace(e->begin, e->end - e->begin, e->text);
+    }
+    return edits.size();
+}
+
 } // namespace gles
 } // namespace android

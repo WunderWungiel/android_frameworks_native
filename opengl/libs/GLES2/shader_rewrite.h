@@ -33,5 +33,16 @@ namespace gles {
  */
 size_t flattenTrivialDoWhile(std::string& src);
 
+/*
+ * Makes every float/int-family member of every uniform block highp: lowp and
+ * mediump qualifiers are replaced, members without a qualifier get one. bool
+ * and struct-typed members are left alone. Uniform blocks only exist in GLSL
+ * ES 3.00+, where highp is always available in all stages.
+ *
+ * Returns the number of members changed. Sources that do not parse are left
+ * untouched.
+ */
+size_t promoteUniformBlockPrecision(std::string& src);
+
 } // namespace gles
 } // namespace android

@@ -321,6 +321,13 @@ void glGetInteger64v(GLenum pname, GLint64 * data) {
  *   shaders). When every break of such a block is in tail position the wrapper
  *   is redundant and is removed (see shader_rewrite.cpp).
  *
+ * - Adreno 3xx: in fragment shaders, mediump uniform block members whose
+ *   std140 offset is not a multiple of 16 read as 0 (e.g. a float right after
+ *   a vec2; members at vec4 slot starts read fine). Flutter/Impeller declares
+ *   its FragInfo members without a precision qualifier under
+ *   `precision mediump float`, so e.g. the SDF circle shader sees radius 0
+ *   and draws nothing. Uniform block members are promoted to highp.
+ *
  * Each rewrite only happens when the current driver needs it.
  */
 
@@ -344,6 +351,7 @@ enum : int {
     kQuirkUnknown = -1,
     kQuirkExternalEssl3 = 1 << 0,
     kQuirkFlattenDoWhile = 1 << 1,
+    kQuirkHighpUniformBlocks = 1 << 2,
 };
 
 static int shaderSourceQuirks() {
@@ -362,8 +370,9 @@ static int shaderSourceQuirks() {
                   "rewriting it to GL_OES_EGL_image_external");
         }
         if (strncmp(renderer, "Adreno (TM) 3", strlen("Adreno (TM) 3")) == 0) {
-            q |= kQuirkFlattenDoWhile;
-            ALOGI("glShaderSource: %s, flattening do-while(false) blocks", renderer);
+            q |= kQuirkFlattenDoWhile | kQuirkHighpUniformBlocks;
+            ALOGI("glShaderSource: %s, flattening do-while(false) blocks, "
+                  "promoting uniform block members to highp", renderer);
         }
         state.store(q, std::memory_order_relaxed);
     }
@@ -387,19 +396,21 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
                                                    : strlen(string[i]));
     };
 
-    bool hasEssl3 = false, hasFalse = false;
+    bool hasEssl3 = false, hasFalse = false, hasUniform = false;
     for (GLsizei i = 0; i < count; i++) {
         const std::string_view p = piece(i);
         hasEssl3 = hasEssl3 || p.find(kEssl3) != std::string_view::npos;
         hasFalse = hasFalse || p.find("false") != std::string_view::npos;
+        hasUniform = hasUniform || p.find("uniform") != std::string_view::npos;
     }
-    if (!hasEssl3 && !hasFalse) {
+    if (!hasEssl3 && !hasFalse && !hasUniform) {
         return __glShaderSource(shader, count, string, length);
     }
     const int quirks = shaderSourceQuirks();
     const bool essl3 = hasEssl3 && (quirks & kQuirkExternalEssl3);
     const bool flatten = hasFalse && (quirks & kQuirkFlattenDoWhile);
-    if (!essl3 && !flatten) {
+    const bool highp = hasUniform && (quirks & kQuirkHighpUniformBlocks);
+    if (!essl3 && !flatten && !highp) {
         return __glShaderSource(shader, count, string, length);
     }
 
@@ -417,6 +428,10 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
     }
     if (flatten) {
         android::gles::flattenTrivialDoWhile(src);
+    }
+    if (highp) {
+        // Last: it inserts text, the rewrites above rely on unchanged offsets.
+        android::gles::promoteUniformBlockPrecision(src);
     }
     const GLchar* ptr = src.c_str();
     const GLint len = static_cast<GLint>(src.size());
