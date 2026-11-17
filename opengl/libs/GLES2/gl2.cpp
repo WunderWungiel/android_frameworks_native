@@ -19,6 +19,11 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
+#include <atomic>
+#include <string>
+#include <string_view>
+#include <vector>
+
 #include <log/log.h>
 #include <cutils/properties.h>
 
@@ -299,4 +304,91 @@ void glGetIntegerv(GLenum pname, GLint * data) {
 void glGetInteger64v(GLenum pname, GLint64 * data) {
     egl_connection_t* const cnx = egl_get_connection();
     return cnx->platform.glGetInteger64v(pname, data);
+}
+
+/*
+ * glShaderSource() is wrapped for drivers that support external textures in
+ * GLSL ES 3.00 shaders but only advertise GL_OES_EGL_image_external, not
+ * GL_OES_EGL_image_external_essl3 (e.g. Adreno 3xx). Shaders that enable the
+ * essl3 extension fail to compile there, so its name is replaced with the base
+ * extension (padded with spaces to keep every string length unchanged). The
+ * rewrite only happens when the driver lacks essl3 but has the base extension.
+ */
+
+extern "C" {
+    void __glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
+                          const GLint *length);
+}
+
+static bool hasGlExtension(const char* extensions, const char* name) {
+    if (!extensions) return false;
+    const size_t len = strlen(name);
+    for (const char* p = extensions; (p = strstr(p, name)) != nullptr; p += len) {
+        if ((p == extensions || p[-1] == ' ') && (p[len] == ' ' || p[len] == '\0')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool needsExternalEssl3Rewrite() {
+    // 0 = not checked yet, 1 = rewrite, 2 = pass through. One driver per process.
+    static std::atomic<int> state{0};
+    int s = state.load(std::memory_order_relaxed);
+    if (s == 0) {
+        const char* ext = reinterpret_cast<const char*>(__glGetString(GL_EXTENSIONS));
+        if (!ext) return false; // no current context; retry next time
+        s = (!hasGlExtension(ext, "GL_OES_EGL_image_external_essl3") &&
+             hasGlExtension(ext, "GL_OES_EGL_image_external")) ? 1 : 2;
+        if (s == 1) {
+            ALOGI("glShaderSource: driver lacks GL_OES_EGL_image_external_essl3, "
+                  "rewriting it to GL_OES_EGL_image_external");
+        }
+        state.store(s, std::memory_order_relaxed);
+    }
+    return s == 1;
+}
+
+void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
+                    const GLint *length) {
+    static constexpr char kEssl3[] = "GL_OES_EGL_image_external_essl3";
+    static constexpr size_t kEssl3Len = sizeof(kEssl3) - 1;
+    static constexpr size_t kBaseLen = sizeof("GL_OES_EGL_image_external") - 1;
+
+    if (count <= 0 || string == nullptr) {
+        return __glShaderSource(shader, count, string, length);
+    }
+
+    auto pieceLen = [&](GLsizei i) -> size_t {
+        return (length && length[i] >= 0) ? static_cast<size_t>(length[i])
+                                          : (string[i] ? strlen(string[i]) : 0);
+    };
+
+    bool found = false;
+    for (GLsizei i = 0; i < count && !found; i++) {
+        if (string[i]) {
+            found = std::string_view(string[i], pieceLen(i)).find(kEssl3) !=
+                    std::string_view::npos;
+        }
+    }
+    if (!found || !needsExternalEssl3Rewrite()) {
+        return __glShaderSource(shader, count, string, length);
+    }
+
+    std::vector<std::string> copies(count);
+    std::vector<const GLchar*> ptrs(count);
+    for (GLsizei i = 0; i < count; i++) {
+        if (!string[i]) {
+            ptrs[i] = nullptr;
+            continue;
+        }
+        std::string& s = copies[i];
+        s.assign(string[i], pieceLen(i));
+        for (size_t pos = 0; (pos = s.find(kEssl3, pos)) != std::string::npos; pos += kEssl3Len) {
+            s.replace(pos + kBaseLen, kEssl3Len - kBaseLen, kEssl3Len - kBaseLen, ' ');
+        }
+        ptrs[i] = s.c_str();
+    }
+    // Lengths are unchanged, so the caller's length array stays valid.
+    __glShaderSource(shader, count, ptrs.data(), length);
 }

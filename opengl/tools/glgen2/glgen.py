@@ -84,9 +84,9 @@ def fmtArgs(params):
     return ', '.join(p[0] for p in params)
 
 def overrideSymbolName(sym, apiname):
-    # The wrapper intercepts various glGet and glGetString functions and
-    # (sometimes) calls the generated thunk which dispatches to the
-    # driver's implementation
+    # The wrapper intercepts various glGet and glGetString functions (and
+    # glShaderSource, see gl2.cpp) and (sometimes) calls the generated thunk
+    # which dispatches to the driver's implementation
     wrapped_get_syms = {
         'gles1' : [
             'glGetString'
@@ -98,6 +98,7 @@ def overrideSymbolName(sym, apiname):
             'glGetFloatv',
             'glGetIntegerv',
             'glGetInteger64v',
+            'glShaderSource',
         ],
     }
     if sym in wrapped_get_syms.get(apiname):
