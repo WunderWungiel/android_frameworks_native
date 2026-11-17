@@ -22,12 +22,12 @@
 #include <atomic>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include <log/log.h>
 #include <cutils/properties.h>
 
 #include "../hooks.h"
+#include "shader_rewrite.h"
 #include "../egl_impl.h"
 
 using namespace android;
@@ -307,12 +307,21 @@ void glGetInteger64v(GLenum pname, GLint64 * data) {
 }
 
 /*
- * glShaderSource() is wrapped for drivers that support external textures in
- * GLSL ES 3.00 shaders but only advertise GL_OES_EGL_image_external, not
- * GL_OES_EGL_image_external_essl3 (e.g. Adreno 3xx). Shaders that enable the
- * essl3 extension fail to compile there, so its name is replaced with the base
- * extension (padded with spaces to keep every string length unchanged). The
- * rewrite only happens when the driver lacks essl3 but has the base extension.
+ * glShaderSource() is wrapped to work around shader compiler bugs of old drivers:
+ *
+ * - Drivers that support external textures in GLSL ES 3.00 shaders but only
+ *   advertise GL_OES_EGL_image_external, not GL_OES_EGL_image_external_essl3
+ *   (e.g. Adreno 3xx): shaders that enable the essl3 extension fail to compile,
+ *   so its name is replaced with the base extension (padded with spaces).
+ *
+ * - Adreno 3xx: glLinkProgram() crashes (SIGSEGV in libsc-a3xx.so) on loops
+ *   whose breaks sit in nested if/else branches, e.g. the
+ *   `do { if (a) { if (b) { ...; break; } else { ...; break; } } ... } while(false);`
+ *   blocks SPIRV-Cross emits for structured selections (Flutter/Impeller
+ *   shaders). When every break of such a block is in tail position the wrapper
+ *   is redundant and is removed (see shader_rewrite.cpp).
+ *
+ * Each rewrite only happens when the current driver needs it.
  */
 
 extern "C" {
@@ -331,22 +340,34 @@ static bool hasGlExtension(const char* extensions, const char* name) {
     return false;
 }
 
-static bool needsExternalEssl3Rewrite() {
-    // 0 = not checked yet, 1 = rewrite, 2 = pass through. One driver per process.
-    static std::atomic<int> state{0};
-    int s = state.load(std::memory_order_relaxed);
-    if (s == 0) {
+enum : int {
+    kQuirkUnknown = -1,
+    kQuirkExternalEssl3 = 1 << 0,
+    kQuirkFlattenDoWhile = 1 << 1,
+};
+
+static int shaderSourceQuirks() {
+    // One driver per process, so the result is computed once.
+    static std::atomic<int> state{kQuirkUnknown};
+    int q = state.load(std::memory_order_relaxed);
+    if (q == kQuirkUnknown) {
         const char* ext = reinterpret_cast<const char*>(__glGetString(GL_EXTENSIONS));
-        if (!ext) return false; // no current context; retry next time
-        s = (!hasGlExtension(ext, "GL_OES_EGL_image_external_essl3") &&
-             hasGlExtension(ext, "GL_OES_EGL_image_external")) ? 1 : 2;
-        if (s == 1) {
+        const char* renderer = reinterpret_cast<const char*>(__glGetString(GL_RENDERER));
+        if (!ext || !renderer) return 0; // no current context; retry next time
+        q = 0;
+        if (!hasGlExtension(ext, "GL_OES_EGL_image_external_essl3") &&
+            hasGlExtension(ext, "GL_OES_EGL_image_external")) {
+            q |= kQuirkExternalEssl3;
             ALOGI("glShaderSource: driver lacks GL_OES_EGL_image_external_essl3, "
                   "rewriting it to GL_OES_EGL_image_external");
         }
-        state.store(s, std::memory_order_relaxed);
+        if (strncmp(renderer, "Adreno (TM) 3", strlen("Adreno (TM) 3")) == 0) {
+            q |= kQuirkFlattenDoWhile;
+            ALOGI("glShaderSource: %s, flattening do-while(false) blocks", renderer);
+        }
+        state.store(q, std::memory_order_relaxed);
     }
-    return s == 1;
+    return q;
 }
 
 void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
@@ -359,36 +380,45 @@ void glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string,
         return __glShaderSource(shader, count, string, length);
     }
 
-    auto pieceLen = [&](GLsizei i) -> size_t {
-        return (length && length[i] >= 0) ? static_cast<size_t>(length[i])
-                                          : (string[i] ? strlen(string[i]) : 0);
+    auto piece = [&](GLsizei i) -> std::string_view {
+        if (!string[i]) return {};
+        return std::string_view(string[i], (length && length[i] >= 0)
+                                                   ? static_cast<size_t>(length[i])
+                                                   : strlen(string[i]));
     };
 
-    bool found = false;
-    for (GLsizei i = 0; i < count && !found; i++) {
-        if (string[i]) {
-            found = std::string_view(string[i], pieceLen(i)).find(kEssl3) !=
-                    std::string_view::npos;
-        }
+    bool hasEssl3 = false, hasFalse = false;
+    for (GLsizei i = 0; i < count; i++) {
+        const std::string_view p = piece(i);
+        hasEssl3 = hasEssl3 || p.find(kEssl3) != std::string_view::npos;
+        hasFalse = hasFalse || p.find("false") != std::string_view::npos;
     }
-    if (!found || !needsExternalEssl3Rewrite()) {
+    if (!hasEssl3 && !hasFalse) {
+        return __glShaderSource(shader, count, string, length);
+    }
+    const int quirks = shaderSourceQuirks();
+    const bool essl3 = hasEssl3 && (quirks & kQuirkExternalEssl3);
+    const bool flatten = hasFalse && (quirks & kQuirkFlattenDoWhile);
+    if (!essl3 && !flatten) {
         return __glShaderSource(shader, count, string, length);
     }
 
-    std::vector<std::string> copies(count);
-    std::vector<const GLchar*> ptrs(count);
+    // The driver concatenates the pieces anyway; join them so that rewrites can
+    // see whole statements.
+    std::string src;
     for (GLsizei i = 0; i < count; i++) {
-        if (!string[i]) {
-            ptrs[i] = nullptr;
-            continue;
-        }
-        std::string& s = copies[i];
-        s.assign(string[i], pieceLen(i));
-        for (size_t pos = 0; (pos = s.find(kEssl3, pos)) != std::string::npos; pos += kEssl3Len) {
-            s.replace(pos + kBaseLen, kEssl3Len - kBaseLen, kEssl3Len - kBaseLen, ' ');
-        }
-        ptrs[i] = s.c_str();
+        src.append(piece(i));
     }
-    // Lengths are unchanged, so the caller's length array stays valid.
-    __glShaderSource(shader, count, ptrs.data(), length);
+    if (essl3) {
+        for (size_t pos = 0; (pos = src.find(kEssl3, pos)) != std::string::npos;
+             pos += kEssl3Len) {
+            src.replace(pos + kBaseLen, kEssl3Len - kBaseLen, kEssl3Len - kBaseLen, ' ');
+        }
+    }
+    if (flatten) {
+        android::gles::flattenTrivialDoWhile(src);
+    }
+    const GLchar* ptr = src.c_str();
+    const GLint len = static_cast<GLint>(src.size());
+    __glShaderSource(shader, 1, &ptr, &len);
 }

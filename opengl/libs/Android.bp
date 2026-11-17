@@ -272,7 +272,10 @@ cc_library_shared {
         // Don't export EGL/include from the LLNDK variant.
         override_export_include_dirs: [],
     },
-    srcs: ["GLES2/gl2.cpp"],
+    srcs: [
+        "GLES2/gl2.cpp",
+        "GLES2/shader_rewrite.cpp",
+    ],
     cflags: ["-DLOG_TAG=\"libGLESv2\""],
 
     // Bug: http://b/133874658  Disable native_coverage as we investigate a
@@ -292,6 +295,9 @@ cc_library_shared {
         // Don't export EGL/include from the LLNDK variant.
         override_export_include_dirs: [],
     },
-    srcs: ["GLES2/gl2.cpp"],
+    srcs: [
+        "GLES2/gl2.cpp",
+        "GLES2/shader_rewrite.cpp",
+    ],
     cflags: ["-DLOG_TAG=\"libGLESv3\""],
 }
